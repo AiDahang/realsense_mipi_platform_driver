@@ -20,7 +20,7 @@ cp "$module_repo/kernel/realsense/d4xx_main.c" "$module_repo/kernel/realsense/d4
     "$module_repo/kernel/realsense/d585_dfu_v2_bench.h" "$module_out/"
 cat > "$module_out/Makefile" <<'MAKEFILE'
 obj-m += d4xx.o
-d4xx-objs := d4xx_main.o d4xx_desc.o
+d4xx-y := d4xx_main.o d4xx_desc.o
 ccflags-y += -I$(NVIDIA_OOT)/include
 ccflags-y += -I$(NVIDIA_CONFTEST)
 ccflags-y += -DCONFIG_VIDEO_D4XX_SERDES -DCONFIG_TEGRA_CAMERA_PLATFORM
