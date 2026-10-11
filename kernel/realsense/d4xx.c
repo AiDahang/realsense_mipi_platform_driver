@@ -3109,7 +3109,8 @@ static int serdes_get_ser_pipe_id(struct ds5 *state, int dser_pipe_id,
 }
 
 static int ds5_setup_pipeline(struct ds5 *state, u8 data_type1, u8 data_type2,
-			      int pipe_id, u32 vc_id, int ser_vc_id)
+			      int pipe_id, u32 vc_id, int ser_vc_id,
+			      bool *ser_pipe_armed)
 {
 	int ret = 0;
 	/* ser_pipe_id depends on both the serializer and the deserializer
@@ -3122,6 +3123,9 @@ static int ds5_setup_pipeline(struct ds5 *state, u8 data_type1, u8 data_type2,
 			"set ser pipe %d, dser pipe %d, data_type1: 0x%x, data_type2: 0x%x, link: %u, ser_vc_id: %u, vc_id: %u\n",
 			ser_pipe_id, pipe_id, data_type1, data_type2, state->gmsl_link,
 			ser_vc_id, vc_id);
+	/* A failed set_pipe may still arm the VC. Keep this attempt across
+	 * retries so a later allocation error cannot skip its cleanup. */
+	*ser_pipe_armed = true;
 	ret |= state->ser_ops->set_pipe(state->ser_dev, ser_pipe_id,
 				data_type1, data_type2, ser_vc_id);
 	ret |= state->dser_ops->set_pipe(state->dser_dev, pipe_id,
@@ -3165,14 +3169,14 @@ static u8 ds5_wire_data_type(const struct ds5_format *format)
 		format->data_type;
 }
 
-static int ds5_configure(struct ds5 *state)
+static int ds5_configure(struct ds5 *state, bool *ser_pipe_armed)
 {
 	struct ds5_sensor *sensor;
 	u16 md_fmt, vc_id;
 #ifdef CONFIG_VIDEO_D4XX_SERDES
 	u16 data_type1, data_type2;
 	bool is_calib = 0;
-	int ser_vc_id;
+	int ser_vc_id, pipe_id;
 #endif
 	u16 md_vc = 0;
 	u16 dt_addr, md_addr, override_addr, fps_addr, width_addr, height_addr;
@@ -3267,20 +3271,25 @@ static int ds5_configure(struct ds5 *state)
 		 */
 		if (state->ser_ops == &max96717_interface &&
 		    state->dser_ops->get_multi_vc_pipe_id)
-			sensor->pipe_id =
+			pipe_id =
 				state->dser_ops->get_multi_vc_pipe_id(state->dser_dev,
 								      state->gmsl_link);
 		else
-			sensor->pipe_id =
+			pipe_id =
 				state->dser_ops->get_available_pipe_id(state->dser_dev, (int)vc_id);
 		mutex_unlock(&serdes_lock__);
-		if (sensor->pipe_id < 0) {
+		if (pipe_id < 0) {
+			/* Cache an allocated ID or the sentinel, never an errno:
+			 * same-format retries must allocate and configure again. */
+			sensor->pipe_id = PIPE_NOT_CONFIGURED;
 			dev_err(&state->client->dev, "No free pipe in %s\n",state->dser_ops->name);
 			return -ENOSR;
 		}
+		sensor->pipe_id = pipe_id;
 		mutex_lock(&serdes_lock__);
 		ret = ds5_setup_pipeline(state, data_type1, data_type2,
-					 sensor->pipe_id, vc_id, ser_vc_id);
+					 sensor->pipe_id, vc_id, ser_vc_id,
+					 ser_pipe_armed);
 		// reset data path when switching to Y12I
 		if (is_calib)
 			state->dser_ops->reset_oneshot(state->dser_dev);
@@ -7998,6 +8007,7 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 	struct ds5_sensor *sensor = state->mux.last_set;
 	u16 expected_streaming_state;
 	bool ds5_config_done = !on; /* for stop, skip config */
+	bool ser_pipe_armed = false;
 	bool reset_invalidated = false;
 	bool *streaming_flag = NULL;
 	int cur_ds5 = atomic_read(ds5_get_reset_gen(state));
@@ -8151,11 +8161,11 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 			time_before(jiffies, timeout); i++, msleep_range(i*DS5_START_POLL_TIME))
 	{
 		if (!ds5_config_done) {
-			ret = ds5_configure(state);
+			ret = ds5_configure(state, &ser_pipe_armed);
 			if (ret < 0) {
 				if (ret == -ENOSR) {
 					/* No recovery can help if no resources are available */
-					return ret;
+					goto restore_streaming;
 				}
 				dev_warn(&state->client->dev, "stream %d config failed, retry %d, %dms\n",
 					stream_id, i, jiffies_to_msecs(jiffies - ts));
@@ -8235,23 +8245,38 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 			ds5_write(state, DS5_START_STOP_STREAM,
 				(on ? DS5_STREAM_STOP : DS5_STREAM_START) | stream_id);
 		}
+		ret = -EAGAIN;
+restore_streaming:
 #ifdef CONFIG_VIDEO_D4XX_SERDES
+		/* Also reached after allocation failure on a later retry. The
+		 * serializer attempt is independent of the current pipe ID. */
 		if (on && sensor->pipe_id >= 0) {
+			int cleanup_ret;
+
 			mutex_lock(&serdes_lock__);
-			ret = state->dser_ops->release_pipe(state->dser_dev, sensor->pipe_id);
+			cleanup_ret = state->dser_ops->release_pipe(state->dser_dev,
+								 sensor->pipe_id);
 			mutex_unlock(&serdes_lock__);
-			if (ret < 0) {
+			if (cleanup_ret < 0) {
 				dev_warn(&state->client->dev, "release pipe failed\n");
 			} else {
 				sensor->pipe_id = PIPE_NOT_CONFIGURED;
 			}
+		}
+		if (on && ser_pipe_armed && state->ser_ops->stream_stop) {
+			int ser_vc_id = state->dser_ops->get_ser_vc_id ?
+				state->dser_ops->get_ser_vc_id(state->dser_dev,
+							state->gmsl_link, vc_id) :
+				(int)vc_id;
+
+			if (ser_vc_id >= 0)
+				state->ser_ops->stream_stop(state->ser_dev, ser_vc_id);
 		}
 #endif
 		mutex_lock(&state->ds5_dev->lock);
 		*streaming_flag = restore_val;
 		mutex_unlock(&state->ds5_dev->lock);
 		sensor->streaming = restore_val;
-		ret = -EAGAIN;
 	}
 	else if (!on)
 	{
