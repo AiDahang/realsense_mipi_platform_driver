@@ -82,11 +82,11 @@ struct dser_interface {
 	int (*recover_link)(struct device *dev, struct device *ser_dev, u32 link);
 	int (*setup_fsync)(struct device *dev, u32 fps);
 	int (*disable_fsync)(struct device *dev);
-	
+
 	/* Device registration */
 	int (*sdev_register)(struct device *dev, struct gmsl_link_ctx *g_ctx);
 	int (*sdev_unregister)(struct device *dev, struct device *s_dev);
-	
+
 	/* Power management */
 	int (*power_on)(struct device *dev);
 	void (*power_off)(struct device *dev);
@@ -229,6 +229,7 @@ enum rs_pixfmt {
 	RS_PIXFMT_GRBG16,
 	RS_PIXFMT_SBGGR10P,
 	RS_PIXFMT_IMU,
+	RS_PIXFMT_RSVL,
 };
 /*
  * FW version major byte identifies the family in recovery, where DEVICE_TYPE
@@ -1209,6 +1210,10 @@ static const struct {
 	/* D401 CSI passthrough: 10bit data riding an opeque 8-bit carrier. */
 	{ RS_PIXFMT_SBGGR10P,   MEDIA_BUS_FMT_RS_SBGGR10P_1X8, GMSL_CSI_DT_RAW_8 },
 	{ RS_PIXFMT_IMU,        MEDIA_BUS_FMT_Y8_1X8 },
+	/* RSVL is the shared VC2 queue geometry, not a PD/OCC selector. */
+#ifdef MEDIA_BUS_FMT_RS_VARLEN_1X8
+	{ RS_PIXFMT_RSVL,       MEDIA_BUS_FMT_RS_VARLEN_1X8, GMSL_CSI_DT_RAW_8 },
+#endif
 };
 
 /* Probed a word at a time: legacy FW loads one 16-bit word for an unmapped
@@ -3549,6 +3554,9 @@ enum ds5_sync_mode {
 #define D500_CAMERA_CID_DUAL_RGB_AE_POLICY (DS5_CAMERA_CID_BASE + 37)
 #define D500_CAMERA_CID_GYRO_SENSITIVITY (DS5_CAMERA_CID_BASE + 38)
 #define D500_CAMERA_CID_ACCEL_SENSITIVITY (DS5_CAMERA_CID_BASE + 39)
+/* USB Inference XU 0x01: single R/W control. */
+#define D500_CAMERA_CID_OD_DISTANCE	(DS5_CAMERA_CID_BASE + 40)
+/* Reserve CID offsets +41..+43 for future allocation across camera nodes. */
 
 enum d500_device_mode {
 	D500_DEVICE_MODE_3C = 0,
@@ -3583,6 +3591,7 @@ enum d500_accel_sensitivity {
 #define D500_ACCEL_SENSITIVITY_XU_BASE	0x4539
 /* HKR ACKs writes to registers it lacks and reads them back as this byte. */
 #define D500_GMSL_READ_FILL_BYTE	0xff
+#define D500_OD_DISTANCE_XU_BASE	0x4598
 
 /* Auto-exposure algorithm types — mirrors FW ETAeType */
 enum ds5_ae_type {
@@ -4278,6 +4287,58 @@ static void d500_refresh_aligned_depth_default(struct ds5 *state)
 		return;
 
 	WRITE_ONCE(state->ctrls.aligned_depth->default_value, val);
+}
+
+/* Caller holds ds5_dev->lock; one-byte reads are safe on older FW. */
+static int d500_read_od_distance_locked(struct ds5 *state, u8 *value)
+{
+	int ret;
+
+	ret = ds5_raw_read(state, D500_OD_DISTANCE_XU_BASE, value,
+			   sizeof(*value));
+	if (ret)
+		return ret;
+	if (*value == D500_GMSL_READ_FILL_BYTE)
+		return -EOPNOTSUPP;
+	if (*value > 1)
+		return -EBADMSG;
+
+	return 0;
+}
+
+static int d500_get_od_distance(struct ds5 *state, s32 *val)
+{
+	u8 value;
+	int ret;
+
+	mutex_lock(&state->ds5_dev->lock);
+	ret = d500_read_od_distance_locked(state, &value);
+	mutex_unlock(&state->ds5_dev->lock);
+	if (!ret)
+		*val = value;
+
+	return ret;
+}
+
+static int d500_set_od_distance(struct ds5 *state, s32 val)
+{
+	u8 value = val ? 1 : 0;
+	u8 applied;
+	int ret;
+
+	mutex_lock(&state->ds5_dev->lock);
+	ret = ds5_raw_write(state, D500_OD_DISTANCE_XU_BASE, &value,
+			    sizeof(value));
+	if (ret)
+		goto unlock;
+	/* A refused write still ACKs on I2C; only the readback shows it. */
+	ret = d500_read_od_distance_locked(state, &applied);
+	if (!ret && applied != value)
+		ret = -EBUSY;
+unlock:
+	mutex_unlock(&state->ds5_dev->lock);
+
+	return ret;
 }
 
 /* DISABLED has no framework toggle. Mirror v4l2_ctrl_activate()'s lock-free bit
@@ -5050,7 +5111,7 @@ unlock_dpp:
 			}
 		}
 		break;
-	case DS5_CAMERA_CID_AE_ROI_SET: 
+	case DS5_CAMERA_CID_AE_ROI_SET:
 		if (ctrl->p_new.p_u16) {
 			struct hwm_cmd ae_roi_cmd;
 			memcpy(&ae_roi_cmd, &set_ae_roi, sizeof(ae_roi_cmd));
@@ -5303,6 +5364,12 @@ unlock_dpp:
 			    DS5_DEVICE_TYPE_D58X)
 			ret = d500_set_aligned_depth(state, ctrl->val);
 		break;
+	case D500_CAMERA_CID_OD_DISTANCE:
+		if (state->is_depth &&
+		    READ_ONCE(state->ds5_dev->cached_device_type) ==
+			    DS5_DEVICE_TYPE_D58X)
+			ret = d500_set_od_distance(state, ctrl->val);
+		break;
 	case DS5_CAMERA_CID_PWM:
 		if (state->is_depth)
 			ret = ds5_write(state, base | DS5_PWM_FREQUENCY, ctrl->val);
@@ -5421,7 +5488,7 @@ static int ds5_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct ds5 *state = container_of(ctrl->handler, struct ds5,
 			ctrls.handler);
-			
+
 	u32 data;
 	const struct d500_dpp_ctrl_desc *dpp_desc;
 	int ret = 0;
@@ -5667,7 +5734,7 @@ static int ds5_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 		}
 		memcpy(ae_setpoint_cmd, &get_ae_setpoint, sizeof(struct hwm_cmd));
 		ret = ds5_hwmc_send(state, sizeof(struct hwm_cmd), ae_setpoint_cmd);
-		if (ret) {		
+		if (ret) {
 			devm_kfree(&state->client->dev, ae_setpoint_cmd);
 			return ret;
 		}
@@ -5709,7 +5776,7 @@ static int ds5_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 		devm_kfree(&state->client->dev, ae_type_cmd);
 		}
 		break;
-	case DS5_CAMERA_CID_HWMC_RW: 
+	case DS5_CAMERA_CID_HWMC_RW:
 		if (ctrl->p_new.p_u8) {
 			unsigned char *data = (unsigned char *)ctrl->p_new.p_u8;
 			u16 dataLen = 0;
@@ -5828,6 +5895,12 @@ static int ds5_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 		    READ_ONCE(state->ds5_dev->cached_device_type) ==
 			    DS5_DEVICE_TYPE_D58X)
 			ret = d500_get_aligned_depth(state, &ctrl->val);
+		break;
+	case D500_CAMERA_CID_OD_DISTANCE:
+		if (state->is_depth &&
+		    READ_ONCE(state->ds5_dev->cached_device_type) ==
+			    DS5_DEVICE_TYPE_D58X)
+			ret = d500_get_od_distance(state, &ctrl->val);
 		break;
 	case DS5_CAMERA_CID_PWM:
 		if (state->is_depth)
@@ -6267,6 +6340,18 @@ static const struct v4l2_ctrl_config d500_ctrl_aligned_depth = {
 	.max = 1,
 	.step = 1,
 	.def = 0,
+	.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+};
+
+static const struct v4l2_ctrl_config d500_ctrl_od_distance = {
+	.ops = &ds5_ctrl_ops,
+	.id = D500_CAMERA_CID_OD_DISTANCE,
+	.name = "Detection Distance",
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.min = 0,
+	.max = 1,
+	.step = 1,
+	.def = 1,
 	.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 };
 
@@ -7339,6 +7424,7 @@ static int ds5_ctrl_init(struct ds5 *state, int sid)
 			ctrls->aligned_depth =
 				v4l2_ctrl_new_custom(hdl, &d500_ctrl_aligned_depth,
 						     sensor);
+			v4l2_ctrl_new_custom(hdl, &d500_ctrl_od_distance, sensor);
 		} else {
 			v4l2_ctrl_new_custom(hdl, &ds5_ctrl_readout_shaping,
 					     sensor);
@@ -7501,7 +7587,21 @@ static int ds5_imu_init(struct i2c_client *c, struct ds5 *state)
 		       &ds5_subdev_ops, "imu");
 }
 
-/* Takes ds5_dev->lock for the EXTERNAL-pad format-count snapshot only. */
+/* The sensor a node streams from, per its DT cam-type; NULL without one. */
+static struct v4l2_subdev *ds5_role_sd(struct ds5 *state)
+{
+	if (state->is_imu)
+		return &state->imu.sensor.sd;
+	if (state->is_y8)
+		return &state->ir.sensor.sd;
+	if (state->is_depth)
+		return &state->depth.sensor.sd;
+	if (state->is_rgb)
+		return &state->rgb.sensor.sd;
+	return NULL;
+}
+
+/* Every pad lists the node's own sensor; a mux without a role has none. */
 static int ds5_mux_enum_mbus_code(struct v4l2_subdev *sd,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 10)
 				     struct v4l2_subdev_pad_config *cfg,
@@ -7512,61 +7612,14 @@ static int ds5_mux_enum_mbus_code(struct v4l2_subdev *sd,
 {
 	struct ds5 *state = container_of(sd, struct ds5, mux.sd.subdev);
 	struct v4l2_subdev_mbus_code_enum tmp = *mce;
-	struct v4l2_subdev *remote_sd;
-	unsigned int n_ir, n_depth;
-	int ret = -1;
+	struct v4l2_subdev *remote_sd = ds5_role_sd(state);
+	int ret;
 
 	dev_dbg(&state->client->dev, "%s(): %s \n", __func__, sd->name);
-	switch (mce->pad) {
-	case DS5_MUX_PAD_IR:
-		remote_sd = &state->ir.sensor.sd;
-		break;
-	case DS5_MUX_PAD_DEPTH:
-		remote_sd = &state->depth.sensor.sd;
-		break;
-	case DS5_MUX_PAD_RGB:
-		remote_sd = &state->rgb.sensor.sd;
-		break;
-	case DS5_MUX_PAD_IMU:
-		remote_sd = &state->imu.sensor.sd;
-		break;
-	case DS5_MUX_PAD_EXTERNAL:
-		/* Snapshot the counts; the forwarded call re-locks and
-		 * re-checks its own bounds.
-		 */
-		mutex_lock(&state->ds5_dev->lock);
-		n_ir = state->ir.sensor.n_formats;
-		n_depth = state->depth.sensor.n_formats;
-		mutex_unlock(&state->ds5_dev->lock);
-		if (mce->index >= n_ir + n_depth)
-			return -EINVAL;
-
-		/*
-		 * First list Left node / Motion Tracker formats, then depth.
-		 * This should also help because D16 doesn't have a direct
-		 * analog in MIPI CSI-2.
-		 */
-		if (mce->index < n_ir) {
-			remote_sd = &state->ir.sensor.sd;
-		} else {
-			tmp.index = mce->index - n_ir;
-			remote_sd = &state->depth.sensor.sd;
-		}
-
-		break;
-	default:
+	if (!remote_sd)
 		return -EINVAL;
-	}
 
 	tmp.pad = 0;
-	if (state->is_rgb)
-		remote_sd = &state->rgb.sensor.sd;
-	if (state->is_depth)
-		remote_sd = &state->depth.sensor.sd;
-	if (state->is_y8)
-		remote_sd = &state->ir.sensor.sd;
-	if (state->is_imu)
-		remote_sd = &state->imu.sensor.sd;
 	/* Locks internally */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 10)
 	ret = ds5_sensor_enum_mbus_code(remote_sd, cfg, &tmp);
@@ -9865,4 +9918,4 @@ MODULE_AUTHOR("Guennadi Liakhovetski <guennadi.liakhovetski@intel.com>,\n\
 				Shikun Ding <shikun.ding@intel.com>,\n\
 				Dmitry Perchanov <dmitry.perchanov@intel.com>");
 MODULE_LICENSE("GPL v2");
-MODULE_VERSION("1.0.7.5");
+MODULE_VERSION("1.0.7.7");
