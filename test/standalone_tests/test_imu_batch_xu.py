@@ -12,6 +12,11 @@ def main():
     cids = dict((name, int(offset)) for name, offset in re.findall(
         r'#define\s+(\w+_CID_\w+)\s+\(DS5_CAMERA_CID_BASE\s*\+\s*(\d+)\)', source))
     assert cids['D500_CAMERA_CID_IMU_BATCH'] == 56
+    assert cids['D500_CAMERA_CID_IMU_BATCH_STATUS'] == 57
+    assert [name for name, offset in cids.items() if offset == 57] == ['D500_CAMERA_CID_IMU_BATCH_STATUS']
+    config = source[source.index('static const struct v4l2_ctrl_config ds5_ctrl_imu_batch_d58x'):source.index('static const struct v4l2_ctrl_config ds5_ctrl_gyro_sensitivity_d58x')]
+    assert '.min = D500_IMU_BATCH_DEFAULT' in config and '.max = D500_IMU_BATCH_PAIR' in config
+    assert 'V4L2_CTRL_FLAG_READ_ONLY' in config
     assert cids['D500_CAMERA_CID_ACCEL_SENSITIVITY'] == 39
     assert [name for name, offset in cids.items() if offset == 56] == ['D500_CAMERA_CID_IMU_BATCH']
     assert 'ds5_ctrl_accel_sensitivity_d58x' in source[source.index('// IMU custom'):]
@@ -70,6 +75,22 @@ def main():
     tests = r'''
     int main(void) {
         u8 status;
+        for (unsigned raw=0; raw<256; ++raw) {
+            reset(raw);
+            int result = d500_get_imu_batch_control(&state, true, &status);
+            if (result) { assert(result == -EBADMSG); continue; }
+            assert((status & 0x1f) == 0);
+            assert(d500_get_imu_batch_control(&state, false, &status) == 0);
+            assert(status == 1 || status == 2);
+            if (raw != 0xff && (raw & 0x80)) {
+                unsigned mode = status;
+                assert(mode == ((raw & 3) == 2 ? 2U : 1U));
+                if (!(raw & 0x20) && (mode == 1 || (raw & 0x40))) {
+                    // An idle supported MODE GET can be written back unchanged.
+                    assert(d500_set_imu_batch(&state, mode) == 0);
+                }
+            } else assert(status == 1);
+        }
         reset(0);assert(d500_get_imu_batch(&state,&status)==0 && status==0);
         reset(0x7f);assert(d500_get_imu_batch(&state,&status)==0 && status==0);
         reset(0xff);assert(d500_get_imu_batch(&state,&status)==0 && status==0);
@@ -132,7 +153,7 @@ def main():
     '''
     with tempfile.TemporaryDirectory(prefix='d4xx-imu-xu-') as tmp:
         c=Path(tmp)/'test.c';exe=Path(tmp)/'test'
-        c.write_text(prefix.replace('    struct shared', constants+'\n    struct shared', 1)+'\n'+function('d500_get_imu_batch')+'\n'+function('d500_set_imu_batch')+tests)
+        c.write_text(prefix.replace('    struct shared', constants+'\n    struct shared', 1)+'\n'+function('d500_get_imu_batch')+'\n'+function('d500_get_imu_batch_control')+'\n'+function('d500_set_imu_batch')+tests)
         subprocess.run([os.environ.get('CC','cc'),'-std=c11','-Wall','-Wextra','-Werror',
                         '-fsanitize=address,undefined',str(c),'-o',str(exe)],check=True)
         subprocess.run([str(exe)],check=True)

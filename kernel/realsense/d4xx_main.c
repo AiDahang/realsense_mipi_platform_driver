@@ -2569,8 +2569,8 @@ enum d500_accel_sensitivity {
 #define D500_GMSL_READ_FILL_BYTE	0xff
 #define D500_OD_DISTANCE_XU_BASE	0x4598
 
-/* GMSL motion XU selector 0x1c: 0/1 = legacy (default 1), 2 = paired.
- * GET bits0/1 report the mode; bits7/6/5 add support/pixel/active status. */
+/* Firmware register: SET 0/1 = legacy, 2 = paired; GET adds status bits.
+ * The public IMU controls split writable mode from read-only status. */
 #define D500_IMU_BATCH_XU_BASE		0x4590
 #define D500_IMU_BATCH_MASK		0x03
 #define D500_IMU_BATCH_DEFAULT		1
@@ -2592,6 +2592,7 @@ enum ds5_ae_type {
 /* USB depth XU 0x10: single R/W control. */
 #define D500_CAMERA_CID_ALIGNED_DEPTH	(DS5_CAMERA_CID_BASE + 55)
 #define D500_CAMERA_CID_IMU_BATCH	(DS5_CAMERA_CID_BASE + 56)
+#define D500_CAMERA_CID_IMU_BATCH_STATUS	(DS5_CAMERA_CID_BASE + 57)
 #define D500_MINZ_XU_BASE		0x4500
 #define D500_DECIMATION_XU_BASE		0x4540
 #define D500_TEMPORAL_XU_BASE		0x4568
@@ -3132,6 +3133,23 @@ static int d500_get_imu_batch(struct ds5 *state, u8 *status)
 	if ((*status & D500_IMU_BATCH_RESERVED) ||
 	    (*status & D500_IMU_BATCH_MASK) > D500_IMU_BATCH_PAIR)
 		return -EBADMSG;
+	return 0;
+}
+
+/* Canonical public mode is symmetric: GET values are valid SET values. */
+static int d500_get_imu_batch_control(struct ds5 *state, bool status_only, u8 *value)
+{
+	u8 status;
+	int ret = d500_get_imu_batch(state, &status);
+
+	if (ret)
+		return ret;
+	if (status_only)
+		*value = status & (D500_IMU_BATCH_SUPPORTED | D500_IMU_BATCH_PIXEL |
+				  D500_IMU_BATCH_ACTIVE);
+	else
+		*value = (status & D500_IMU_BATCH_MASK) == D500_IMU_BATCH_PAIR ?
+			 D500_IMU_BATCH_PAIR : D500_IMU_BATCH_DEFAULT;
 	return 0;
 }
 
@@ -4926,12 +4944,14 @@ static int ds5_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 		}
 		break;
 	case D500_CAMERA_CID_IMU_BATCH:
+	case D500_CAMERA_CID_IMU_BATCH_STATUS:
 		if (state->is_imu && ctrl->p_new.p_s32 &&
 		    READ_ONCE(state->ds5_dev->cached_device_type) ==
 			    DS5_DEVICE_TYPE_D58X) {
 			u8 status;
 
-			ret = d500_get_imu_batch(state, &status);
+			ret = d500_get_imu_batch_control(state,
+				ctrl->id == D500_CAMERA_CID_IMU_BATCH_STATUS, &status);
 			if (!ret)
 				*ctrl->p_new.p_s32 = status;
 		}
@@ -5371,11 +5391,23 @@ static const struct v4l2_ctrl_config ds5_ctrl_imu_batch_d58x = {
 	.id = D500_CAMERA_CID_IMU_BATCH,
 	.name = "GMSL IMU Batch",
 	.type = V4L2_CTRL_TYPE_INTEGER,
-	.min = 0,
-	.max = 255, /* GET includes capability/state; SET accepts only 0..2. */
+	.min = D500_IMU_BATCH_DEFAULT,
+	.max = D500_IMU_BATCH_PAIR,
 	.step = 1,
 	.def = D500_IMU_BATCH_DEFAULT,
 	.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
+};
+
+static const struct v4l2_ctrl_config ds5_ctrl_imu_batch_status_d58x = {
+	.ops = &ds5_ctrl_ops,
+	.id = D500_CAMERA_CID_IMU_BATCH_STATUS,
+	.name = "GMSL IMU Batch Status",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.min = 0,
+	.max = D500_IMU_BATCH_SUPPORTED | D500_IMU_BATCH_PIXEL | D500_IMU_BATCH_ACTIVE,
+	.step = 1,
+	.def = 0,
+	.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_READ_ONLY,
 };
 
 static const struct v4l2_ctrl_config ds5_ctrl_gyro_sensitivity_d58x = {
@@ -6523,6 +6555,7 @@ static int ds5_ctrl_init(struct ds5 *state, int sid)
 					     &ds5_ctrl_accel_sensitivity_d58x,
 					     sensor);
 			v4l2_ctrl_new_custom(hdl, &ds5_ctrl_imu_batch_d58x, sensor);
+			v4l2_ctrl_new_custom(hdl, &ds5_ctrl_imu_batch_status_d58x, sensor);
 		}
 	}
 
