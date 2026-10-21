@@ -5386,15 +5386,22 @@ static const char * const d500_gyro_sensitivity_menu[] = {
 	[D500_GYRO_SENSITIVITY_125_DPS] = "3.8 mDeg/Sec",
 };
 
+/* A menu rejects invalid values; integer controls would silently clamp them. */
+static const char * const ds5_imu_batch_menu[] = {
+	"",
+	"Legacy",
+	"Pair",
+};
+
 static const struct v4l2_ctrl_config ds5_ctrl_imu_batch_d58x = {
 	.ops = &ds5_ctrl_ops,
 	.id = D500_CAMERA_CID_IMU_BATCH,
 	.name = "GMSL IMU Batch",
-	.type = V4L2_CTRL_TYPE_INTEGER,
+	.type = V4L2_CTRL_TYPE_MENU,
 	.min = D500_IMU_BATCH_DEFAULT,
 	.max = D500_IMU_BATCH_PAIR,
-	.step = 1,
 	.def = D500_IMU_BATCH_DEFAULT,
+	.qmenu = ds5_imu_batch_menu,
 	.flags = V4L2_CTRL_FLAG_VOLATILE | V4L2_CTRL_FLAG_EXECUTE_ON_WRITE,
 };
 

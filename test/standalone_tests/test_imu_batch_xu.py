@@ -17,6 +17,8 @@ def main():
     config = source[source.index('static const struct v4l2_ctrl_config ds5_ctrl_imu_batch_d58x'):source.index('static const struct v4l2_ctrl_config ds5_ctrl_gyro_sensitivity_d58x')]
     assert '.min = D500_IMU_BATCH_DEFAULT' in config and '.max = D500_IMU_BATCH_PAIR' in config
     assert 'V4L2_CTRL_FLAG_READ_ONLY' in config
+    mode_config = config[:config.index('static const struct v4l2_ctrl_config ds5_ctrl_imu_batch_status_d58x')]
+    assert '.type = V4L2_CTRL_TYPE_MENU' in mode_config and '.qmenu = ds5_imu_batch_menu' in mode_config
     assert cids['D500_CAMERA_CID_ACCEL_SENSITIVITY'] == 39
     assert [name for name, offset in cids.items() if offset == 56] == ['D500_CAMERA_CID_IMU_BATCH']
     assert 'ds5_ctrl_accel_sensitivity_d58x' in source[source.index('// IMU custom'):]
