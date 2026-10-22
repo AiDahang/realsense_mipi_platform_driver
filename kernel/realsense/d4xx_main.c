@@ -1217,16 +1217,15 @@ static const struct ds5_resolution ds5_size_imu_extended[] = {
 
 static const struct ds5_resolution d58x_size_imu_extended_tunnel_mode[] = {
 	{
-	.width = 256,
+	.width = 38,
 	.height = 1,
 	.framerates = d58x_imu_framerates,
 	.n_framerates = ARRAY_SIZE(d58x_imu_framerates),
 	},
 };
 
-/* D58x uses 256-byte zero-padded lines for one or two unchanged HID38
- * reports in both transports. Pixel requires this width for sync spacing;
- * Tunnel reserves the same capacity so a mode override needs no profile change. */
+/* D58x Pixel lines contain one or two unchanged HID38 reports padded to
+ * 256 bytes. Tunnel retains its existing 38-byte single-report profile. */
 static const struct ds5_resolution ds5_size_imu_extended_d58x_pixel_mode[] = {
 	{
 	.width = 256,
@@ -1667,8 +1666,8 @@ void ds5_apply_builtin_tables(struct ds5 *state, u16 dev_type)
 
 	sensor = &state->imu.sensor;
 	/* Firmware 5.16 (0x0510) and later report 32-bit IMU axis values. D58x
-	 * carries one or two unchanged 38-byte reports in a 256-byte padded line.
-	 * Bundling defaults on for Pixel and is opt-in for Tunnel.
+	 * carries unchanged 38-byte reports. Pixel bundles up to two per padded
+	 * 256-byte line by default; Tunnel remains a single 38-byte report.
 	 */
 	if (dev_type == DS5_DEVICE_TYPE_D58X) {
 		if (state->d58x_pixel_mode)
@@ -3174,6 +3173,10 @@ static int d500_set_imu_batch(struct ds5 *state, u32 mode)
 	}
 	if (status & D500_IMU_BATCH_ACTIVE) {
 		ret = -EBUSY;
+		goto out;
+	}
+	if (mode == D500_IMU_BATCH_PAIR && !(status & D500_IMU_BATCH_PIXEL)) {
+		ret = -EOPNOTSUPP;
 		goto out;
 	}
 	ret = ds5_raw_write(state, D500_IMU_BATCH_XU_BASE, &value, sizeof(value));
