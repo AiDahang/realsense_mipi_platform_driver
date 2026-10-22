@@ -1217,16 +1217,16 @@ static const struct ds5_resolution ds5_size_imu_extended[] = {
 
 static const struct ds5_resolution d58x_size_imu_extended_tunnel_mode[] = {
 	{
-	.width = 38,
+	.width = 256,
 	.height = 1,
 	.framerates = d58x_imu_framerates,
 	.n_framerates = ARRAY_SIZE(d58x_imu_framerates),
 	},
 };
 
-/* D58x behind a PIXEL-mode serdes (d58x_pixel_mode): the 38-byte extended
- * IMU record is zero-padded to a wider wire slot (256) to meet GMSL2
- * pixel-mode minimum sync spacing when sharing the serdes pipe with video. */
+/* D58x uses 256-byte zero-padded lines for one or two unchanged HID38
+ * reports in both transports. Pixel requires this width for sync spacing;
+ * Tunnel reserves the same capacity so a mode override needs no profile change. */
 static const struct ds5_resolution ds5_size_imu_extended_d58x_pixel_mode[] = {
 	{
 	.width = 256,
@@ -1667,8 +1667,8 @@ void ds5_apply_builtin_tables(struct ds5 *state, u16 dev_type)
 
 	sensor = &state->imu.sensor;
 	/* Firmware 5.16 (0x0510) and later report 32-bit IMU axis values. D58x
-	 * always carries the 38-byte extended record; in serdes pixel mode the
-	 * line is zero-padded to 256 to meet GMSL2 minimum sync spacing.
+	 * carries one or two unchanged 38-byte reports in a 256-byte padded line.
+	 * Bundling defaults on for Pixel and is opt-in for Tunnel.
 	 */
 	if (dev_type == DS5_DEVICE_TYPE_D58X) {
 		if (state->d58x_pixel_mode)
@@ -3174,10 +3174,6 @@ static int d500_set_imu_batch(struct ds5 *state, u32 mode)
 	}
 	if (status & D500_IMU_BATCH_ACTIVE) {
 		ret = -EBUSY;
-		goto out;
-	}
-	if (mode == D500_IMU_BATCH_PAIR && !(status & D500_IMU_BATCH_PIXEL)) {
-		ret = -EOPNOTSUPP;
 		goto out;
 	}
 	ret = ds5_raw_write(state, D500_IMU_BATCH_XU_BASE, &value, sizeof(value));
@@ -5390,7 +5386,7 @@ static const char * const d500_gyro_sensitivity_menu[] = {
 static const char * const ds5_imu_batch_menu[] = {
 	"",
 	"Legacy",
-	"Pair",
+	"Bundled",
 };
 
 static const struct v4l2_ctrl_config ds5_ctrl_imu_batch_d58x = {
@@ -6561,7 +6557,14 @@ static int ds5_ctrl_init(struct ds5 *state, int sid)
 			v4l2_ctrl_new_custom(hdl,
 					     &ds5_ctrl_accel_sensitivity_d58x,
 					     sensor);
-			v4l2_ctrl_new_custom(hdl, &ds5_ctrl_imu_batch_d58x, sensor);
+			/* FW selects the boot policy. Registration must not write a mode
+			 * or override an explicit setting on close/reopen. */
+			{
+				struct v4l2_ctrl_config batch_cfg = ds5_ctrl_imu_batch_d58x;
+				batch_cfg.def = state->d58x_pixel_mode ?
+					D500_IMU_BATCH_PAIR : D500_IMU_BATCH_DEFAULT;
+				v4l2_ctrl_new_custom(hdl, &batch_cfg, sensor);
+			}
 			v4l2_ctrl_new_custom(hdl, &ds5_ctrl_imu_batch_status_d58x, sensor);
 		}
 	}

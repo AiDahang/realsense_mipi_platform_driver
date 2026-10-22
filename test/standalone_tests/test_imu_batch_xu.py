@@ -127,7 +127,7 @@ def main():
             assert(d500_set_imu_batch(&state,mode)==-EBUSY && !writes && !shared.lock);
             reset(0xe2);assert(d500_set_imu_batch(&state,mode)==-EBUSY && !writes && !shared.lock);
         }
-        reset(0x81);assert(d500_set_imu_batch(&state,2)==-EOPNOTSUPP && !writes);
+        reset(0x81);assert(d500_set_imu_batch(&state,2)==0 && wire==0x82 && writes==1);
         reset(0);assert(d500_set_imu_batch(&state,2)==-EOPNOTSUPP && !writes);
         for (unsigned mode=0;mode<=2;mode++) {
             reset(0xff);assert(d500_set_imu_batch(&state,mode)==-EOPNOTSUPP);
