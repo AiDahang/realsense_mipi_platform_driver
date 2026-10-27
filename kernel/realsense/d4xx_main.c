@@ -4763,11 +4763,15 @@ static int ds5_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 		if (state->is_imu)
 			return -EINVAL;
 		/* see ds5_hw_set_exposure */
+		mutex_lock(&state->ds5_dev->control_lock);
 		ret = ds5_read(state, base | DS5_MANUAL_EXPOSURE_MSB, &reg);
-		if (ret)
+		if (ret) {
+			mutex_unlock(&state->ds5_dev->control_lock);
 			return ret;
+		}
 		data = ((u32)reg << 16) & 0xffff0000;
 		ret = ds5_read(state, base | DS5_MANUAL_EXPOSURE_LSB, &reg);
+		mutex_unlock(&state->ds5_dev->control_lock);
 		if (ret)
 			return ret;
 		data |= reg;
