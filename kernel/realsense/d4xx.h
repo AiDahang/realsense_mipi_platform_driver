@@ -255,6 +255,7 @@ struct ds5 {
 
 struct ds5_dev {
 	struct mutex lock;
+	struct mutex control_lock;
 
 	/*
 	* Per-camera reset generation counter.

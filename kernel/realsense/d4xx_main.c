@@ -494,8 +494,10 @@ static void ds5_init_global_slots_once(void)
 		return;
 	}
 
-	for (i = 0; i < MAX_DS5_NUM; i++)
+	for (i = 0; i < MAX_DS5_NUM; i++) {
 		mutex_init(&ds5_inited[i].lock);
+		mutex_init(&ds5_inited[i].control_lock);
+	}
 
 	for (i = 0; i < MAX_DSER_NUM; i++)
 		mutex_init(&dser_inited[i].lock);
@@ -616,6 +618,7 @@ static void ds5_init_global_slots_once(void)
 	mutex_lock(&ds5_slots_lock__);
 	if (!ds5_slots_inited) {
 		mutex_init(&ds5_inited[0].lock);
+		mutex_init(&ds5_inited[0].control_lock);
 		ds5_slots_inited = true;
 	}
 	mutex_unlock(&ds5_slots_lock__);
@@ -681,7 +684,13 @@ static inline void msleep_range(unsigned int delay_base)
 #endif
 #endif
 
-static int ds5_write(struct ds5 *state, u16 reg, u16 val)
+static bool ds5_is_control_reg(u16 reg)
+{
+	return (reg & 0xff00) == DS5_DEPTH_CONTROL_BASE ||
+	       (reg & 0xff00) == DS5_RGB_CONTROL_BASE;
+}
+
+static int ds5_write_locked(struct ds5 *state, u16 reg, u16 val)
 {
 	int ret;
 	int retry;
@@ -717,12 +726,28 @@ static int ds5_write(struct ds5 *state, u16 reg, u16 val)
 	return ret;
 }
 
+static int ds5_write(struct ds5 *state, u16 reg, u16 val)
+{
+	bool control = ds5_is_control_reg(reg);
+	int ret;
+
+	if (control)
+		mutex_lock(&state->ds5_dev->control_lock);
+	ret = ds5_write_locked(state, reg, val);
+	if (control)
+		mutex_unlock(&state->ds5_dev->control_lock);
+	return ret;
+}
+
 static int ds5_raw_write(struct ds5 *state, u16 reg,
 		const void *val, size_t val_len)
 {
+	bool control = ds5_is_control_reg(reg);
 	int ret;
 	int retry;
 
+	if (control)
+		mutex_lock(&state->ds5_dev->control_lock);
 	for (retry = 0; retry < DS5_I2C_RETRY_COUNT; retry++) {
 		ret = regmap_raw_write(state->regmap, reg, val, val_len);
 		if (ret == 0)
@@ -744,6 +769,8 @@ static int ds5_raw_write(struct ds5 *state, u16 reg,
 			"%s(): i2c raw write 0x%04x: %d bytes\n",
 			__func__, reg, (int)val_len);
 
+	if (control)
+		mutex_unlock(&state->ds5_dev->control_lock);
 	return ret;
 }
 
@@ -2419,7 +2446,7 @@ static const struct v4l2_subdev_ops ds5_subdev_ops = {
 
 /* InfraRed stream Y8/Y16 */
 
-static int ds5_hw_set_auto_exposure(struct ds5 *state, u32 base, s32 val)
+static int ds5_hw_set_auto_exposure_locked(struct ds5 *state, u32 base, s32 val)
 {
 	if (val != V4L2_EXPOSURE_APERTURE_PRIORITY &&
 		val != V4L2_EXPOSURE_MANUAL)
@@ -2442,7 +2469,17 @@ static int ds5_hw_set_auto_exposure(struct ds5 *state, u32 base, s32 val)
 			val = 0;
 	}
 
-	return ds5_write(state, base | DS5_AUTO_EXPOSURE_MODE, (u16)val);
+	return ds5_write_locked(state, base | DS5_AUTO_EXPOSURE_MODE, (u16)val);
+}
+
+static int ds5_hw_set_auto_exposure(struct ds5 *state, u32 base, s32 val)
+{
+	int ret;
+
+	mutex_lock(&state->ds5_dev->control_lock);
+	ret = ds5_hw_set_auto_exposure_locked(state, base, val);
+	mutex_unlock(&state->ds5_dev->control_lock);
+	return ret;
 }
 
 /*
@@ -2450,7 +2487,7 @@ static int ds5_hw_set_auto_exposure(struct ds5 *state, u32 base, s32 val)
  * Depth/Y8: between 100 and 200000 (200ms)
  * Color: between 100 and 1000000 (1s)
  */
-static int ds5_hw_set_exposure(struct ds5 *state, u32 base, s32 val)
+static int ds5_hw_set_exposure_locked(struct ds5 *state, u32 base, s32 val)
 {
 	int ret = -1;
 
@@ -2467,11 +2504,21 @@ static int ds5_hw_set_exposure(struct ds5 *state, u32 base, s32 val)
 	 *	Depth: 1 is 1 us
 	 */
 
-	ret = ds5_write(state, base | DS5_MANUAL_EXPOSURE_MSB, (u16)(val >> 16));
+	ret = ds5_write_locked(state, base | DS5_MANUAL_EXPOSURE_MSB, (u16)(val >> 16));
 	if (!ret)
-		ret = ds5_write(state, base | DS5_MANUAL_EXPOSURE_LSB,
+		ret = ds5_write_locked(state, base | DS5_MANUAL_EXPOSURE_LSB,
 				(u16)(val & 0xffff));
 
+	return ret;
+}
+
+static int ds5_hw_set_exposure(struct ds5 *state, u32 base, s32 val)
+{
+	int ret;
+
+	mutex_lock(&state->ds5_dev->control_lock);
+	ret = ds5_hw_set_exposure_locked(state, base, val);
+	mutex_unlock(&state->ds5_dev->control_lock);
 	return ret;
 }
 
@@ -2581,7 +2628,7 @@ enum d500_accel_sensitivity {
 #define D500_OD_DISTANCE_XU_BASE	0x4598
 
 #define D500_CONTROL_COMPLETION_BASE 0x4820
-#define D500_CONTROL_POLL_COUNT 200
+#define D500_CONTROL_TIMEOUT_MS 1200
 
 struct d500_control_completion {
 	u8 version;
@@ -2597,19 +2644,18 @@ struct d500_control_completion {
 } __packed;
 
 static int d500_read_control_completion(struct ds5 *state,
-				       struct d500_control_completion *status)
+				       struct d500_control_completion *status,
+				       int reset_generation)
 {
-	u8 header[2];
-	int ret = ds5_raw_read(state, D500_CONTROL_COMPLETION_BASE,
-			      header, sizeof(header));
+	int ret;
 
-	if (ret)
-		return ret;
-	if (header[0] != 1 || header[1] != sizeof(*status))
-		return -EOPNOTSUPP;
+	if (atomic_read(ds5_get_reset_gen(state)) != reset_generation)
+		return -EPIPE;
 
-	ret = ds5_raw_read(state, D500_CONTROL_COMPLETION_BASE,
-			   status, sizeof(*status));
+	ret = regmap_raw_read(state->regmap, D500_CONTROL_COMPLETION_BASE,
+			      status, sizeof(*status));
+	if (atomic_read(ds5_get_reset_gen(state)) != reset_generation)
+		return -EPIPE;
 	if (ret)
 		return ret;
 	if (status->version != 1 || status->size != sizeof(*status))
@@ -2636,9 +2682,12 @@ static int d500_control_error(const struct d500_control_completion *status)
 static int d500_set_rgb_control(struct ds5 *state, u16 offset, s32 value)
 {
 	struct d500_control_completion before, completion;
+	unsigned long deadline;
+	u8 header[2];
 	u16 control_id;
 	u32 expected;
-	int attempt, ret;
+	bool legacy = false;
+	int reset_generation, ret;
 
 	switch (offset) {
 	case DS5_MANUAL_EXPOSURE_LSB:
@@ -2656,33 +2705,56 @@ static int d500_set_rgb_control(struct ds5 *state, u16 offset, s32 value)
 		return -EINVAL;
 	}
 
-	mutex_lock(&state->ds5_dev->lock);
-	for (attempt = 0; attempt < D500_CONTROL_POLL_COUNT; ++attempt) {
-		ret = d500_read_control_completion(state, &before);
-		if (ret)
+	mutex_lock(&state->ds5_dev->control_lock);
+	deadline = jiffies + msecs_to_jiffies(D500_CONTROL_TIMEOUT_MS);
+	reset_generation = atomic_read(ds5_get_reset_gen(state));
+	ret = regmap_raw_read(state->regmap, D500_CONTROL_COMPLETION_BASE,
+			      header, sizeof(header));
+	if (ret)
+		goto unlock;
+	if (header[0] != 1 || header[1] != sizeof(before)) {
+		legacy = true;
+		goto write_control;
+	}
+	for (;;) {
+		if (time_after_eq(jiffies, deadline)) {
+			ret = -EBUSY;
 			goto unlock;
-		if (before.sent == before.completed && before.status != 1)
+		}
+		ret = d500_read_control_completion(state, &before, reset_generation);
+		if (ret == -EBADMSG || ret == -EOPNOTSUPP || ret == -EPIPE)
+			goto unlock;
+		if (!ret && before.sent == before.completed && before.status != 1)
 			break;
 		usleep_range(5000, 6000);
 	}
-	if (attempt == D500_CONTROL_POLL_COUNT) {
+	expected = le32_to_cpu(before.sent) + 1;
+write_control:
+	if (atomic_read(ds5_get_reset_gen(state)) != reset_generation) {
+		ret = -EPIPE;
+		goto unlock;
+	}
+	if (time_after_eq(jiffies, deadline)) {
 		ret = -EBUSY;
 		goto unlock;
 	}
-	expected = le32_to_cpu(before.sent) + 1;
 	if (offset == DS5_MANUAL_EXPOSURE_LSB)
-		ret = ds5_hw_set_exposure(state, DS5_RGB_CONTROL_BASE, value);
+		ret = ds5_hw_set_exposure_locked(state, DS5_RGB_CONTROL_BASE, value);
 	else if (offset == DS5_AUTO_EXPOSURE_MODE)
-		ret = ds5_hw_set_auto_exposure(state, DS5_RGB_CONTROL_BASE, value);
+		ret = ds5_hw_set_auto_exposure_locked(state, DS5_RGB_CONTROL_BASE, value);
 	else
-		ret = ds5_write(state, DS5_RGB_CONTROL_BASE | offset, value);
-	if (ret)
+		ret = ds5_write_locked(state, DS5_RGB_CONTROL_BASE | offset, value);
+	if (ret || legacy)
 		goto unlock;
 
-	for (attempt = 0; attempt < D500_CONTROL_POLL_COUNT; ++attempt) {
-		ret = d500_read_control_completion(state, &completion);
-		if (ret)
+	while (time_before(jiffies, deadline)) {
+		ret = d500_read_control_completion(state, &completion, reset_generation);
+		if (ret == -EBADMSG || ret == -EOPNOTSUPP || ret == -EPIPE)
 			goto unlock;
+		if (time_after_eq(jiffies, deadline))
+			break;
+		if (ret)
+			goto poll_sleep;
 		if (completion.rejected != before.rejected) {
 			ret = le16_to_cpu(completion.control_id) == control_id ?
 				d500_control_error(&completion) : -EAGAIN;
@@ -2703,11 +2775,12 @@ static int d500_set_rgb_control(struct ds5 *state, u16 offset, s32 value)
 				ret = d500_control_error(&completion);
 			goto unlock;
 		}
+poll_sleep:
 		usleep_range(5000, 6000);
 	}
 	ret = -ETIMEDOUT;
 unlock:
-	mutex_unlock(&state->ds5_dev->lock);
+	mutex_unlock(&state->ds5_dev->control_lock);
 	return ret;
 }
 
