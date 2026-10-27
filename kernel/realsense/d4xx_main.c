@@ -700,6 +700,8 @@ static int ds5_write_locked(struct ds5 *state, u16 reg, u16 val)
 	int retry;
 	u8 value[2];
 
+	if (ds5_is_control_reg(reg))
+		lockdep_assert_held(&state->ds5_dev->control_lock);
 	value[1] = val >> 8;
 	value[0] = val & 0x00FF;
 
@@ -2452,6 +2454,7 @@ static const struct v4l2_subdev_ops ds5_subdev_ops = {
 
 static int ds5_hw_set_auto_exposure_locked(struct ds5 *state, u32 base, s32 val)
 {
+	lockdep_assert_held(&state->ds5_dev->control_lock);
 	if (val != V4L2_EXPOSURE_APERTURE_PRIORITY &&
 		val != V4L2_EXPOSURE_MANUAL)
 		return -EINVAL;
@@ -2495,6 +2498,7 @@ static int ds5_hw_set_exposure_locked(struct ds5 *state, u32 base, s32 val)
 {
 	int ret = -1;
 
+	lockdep_assert_held(&state->ds5_dev->control_lock);
 	if (val < 1)
 		val = 1;
 	if ((state->is_depth || state->is_y8) && val > MAX_DEPTH_EXP)
@@ -2649,12 +2653,26 @@ struct d500_control_completion {
 
 static int d500_read_control_completion(struct ds5 *state,
 				       struct d500_control_completion *status,
-				       int reset_generation)
+				       int reset_generation, bool *probe_needed)
 {
+	u8 header[2];
 	int ret;
 
+	lockdep_assert_held(&state->ds5_dev->control_lock);
 	if (atomic_read(ds5_get_reset_gen(state)) != reset_generation)
 		return -EPIPE;
+
+	if (*probe_needed) {
+		ret = regmap_raw_read(state->regmap, D500_CONTROL_COMPLETION_BASE,
+				      header, sizeof(header));
+		if (atomic_read(ds5_get_reset_gen(state)) != reset_generation)
+			return -EPIPE;
+		if (ret)
+			return ret;
+		if (header[0] != 1 || header[1] != sizeof(*status))
+			return -EBADMSG;
+		*probe_needed = false;
+	}
 
 	ret = regmap_raw_read(state->regmap, D500_CONTROL_COMPLETION_BASE,
 			      status, sizeof(*status));
@@ -2662,10 +2680,11 @@ static int d500_read_control_completion(struct ds5 *state,
 		return -EPIPE;
 	if (ret)
 		return ret;
-	if (status->version != 1 || status->size != sizeof(*status))
-		return -EOPNOTSUPP;
-	if (status->status > 3 || status->reserved)
+	if (status->version != 1 || status->size != sizeof(*status) ||
+	    status->status > 3 || status->reserved) {
+		*probe_needed = true;
 		return -EBADMSG;
+	}
 	return 0;
 }
 
@@ -2691,6 +2710,7 @@ static int d500_set_rgb_control(struct ds5 *state, u16 offset, s32 value)
 	u16 control_id;
 	u32 expected;
 	bool legacy = false;
+	bool probe_needed = false;
 	int reset_generation, ret;
 
 	switch (offset) {
@@ -2712,8 +2732,17 @@ static int d500_set_rgb_control(struct ds5 *state, u16 offset, s32 value)
 	mutex_lock(&state->ds5_dev->control_lock);
 	deadline = jiffies + msecs_to_jiffies(D500_CONTROL_TIMEOUT_MS);
 	reset_generation = atomic_read(ds5_get_reset_gen(state));
-	ret = regmap_raw_read(state->regmap, D500_CONTROL_COMPLETION_BASE,
-			      header, sizeof(header));
+	do {
+		ret = regmap_raw_read(state->regmap, D500_CONTROL_COMPLETION_BASE,
+				      header, sizeof(header));
+		if (atomic_read(ds5_get_reset_gen(state)) != reset_generation) {
+			ret = -EPIPE;
+			goto unlock;
+		}
+		if (!ret || time_after_eq(jiffies, deadline))
+			break;
+		usleep_range(5000, 6000);
+	} while (time_before(jiffies, deadline));
 	if (ret)
 		goto unlock;
 	if (header[0] != 1 || header[1] != sizeof(before)) {
@@ -2725,8 +2754,9 @@ static int d500_set_rgb_control(struct ds5 *state, u16 offset, s32 value)
 			ret = -EBUSY;
 			goto unlock;
 		}
-		ret = d500_read_control_completion(state, &before, reset_generation);
-		if (ret == -EBADMSG || ret == -EOPNOTSUPP || ret == -EPIPE)
+		ret = d500_read_control_completion(state, &before, reset_generation,
+						   &probe_needed);
+		if (ret == -EPIPE)
 			goto unlock;
 		if (!ret && before.sent == before.completed && before.status != 1)
 			break;
@@ -2752,11 +2782,10 @@ write_control:
 		goto unlock;
 
 	while (time_before(jiffies, deadline)) {
-		ret = d500_read_control_completion(state, &completion, reset_generation);
-		if (ret == -EBADMSG || ret == -EOPNOTSUPP || ret == -EPIPE)
+		ret = d500_read_control_completion(state, &completion, reset_generation,
+						   &probe_needed);
+		if (ret == -EPIPE)
 			goto unlock;
-		if (time_after_eq(jiffies, deadline))
-			break;
 		if (ret)
 			goto poll_sleep;
 		if (completion.rejected != before.rejected) {
@@ -2780,6 +2809,8 @@ write_control:
 			goto unlock;
 		}
 poll_sleep:
+		if (time_after_eq(jiffies, deadline))
+			break;
 		usleep_range(5000, 6000);
 	}
 	ret = -ETIMEDOUT;
